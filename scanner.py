@@ -6,9 +6,6 @@ import yfinance as yf
 from bs4 import BeautifulSoup
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# ==========================================
-# 1. 港股通觀察名單（直接寫上中文名，免去 yfinance 慢速查詢）
-# ==========================================
 WATCHLIST = {
     "00700": "騰訊控股", "03690": "美團-W", "01810": "小米集團-W",
     "09988": "阿里巴巴-W", "00941": "中國移動", "00883": "中國海洋石油",
@@ -25,23 +22,36 @@ RETAIL_IDS = {"B01955", "B01491", "B01590", "B02153", "B01274"}
 
 CCASS_URL = "https://www3.hkexnews.hk/sdw/search/searchsdw_c.aspx"
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Referer": CCASS_URL,
+    "Origin": "https://www3.hkexnews.hk",
 }
+
+
+def extract_cell(row, css_class):
+    td = row.select_one(f"td.{css_class}")
+    if not td:
+        return ""
+    body = td.select_one("div.mobile-list-body")
+    return body.get_text(strip=True) if body else td.get_text(strip=True)
 
 
 def get_ccass_snapshot(session, stock_code, date_str):
     """抓取指定日期 (YYYY/MM/DD) 的 HKEX CCASS 持倉快照"""
     try:
-        r_get = session.get(CCASS_URL, headers=HEADERS, timeout=8)
+        r_get = session.get(CCASS_URL, headers=HEADERS, timeout=10)
         soup = BeautifulSoup(r_get.text, "lxml")
 
         viewstate = soup.find("input", {"id": "__VIEWSTATE"})
         generator = soup.find("input", {"id": "__VIEWSTATEGENERATOR"})
+        validation = soup.find("input", {"id": "__EVENTVALIDATION"})
         if not viewstate or not generator:
+            print(f"[{stock_code}] 無法取得 VIEWSTATE (HTTP {r_get.status_code})", flush=True)
             return None
 
         payload = {
             "__EVENTTARGET": "btnSearch",
+            "__EVENTARGUMENT": "",
             "__VIEWSTATE": viewstate["value"],
             "__VIEWSTATEGENERATOR": generator["value"],
             "today": datetime.datetime.now().strftime("%Y%m%d"),
@@ -50,8 +60,10 @@ def get_ccass_snapshot(session, stock_code, date_str):
             "txtShareholdingDate": date_str,
             "txtStockCode": stock_code.zfill(5),
         }
+        if validation:
+            payload["__EVENTVALIDATION"] = validation["value"]
 
-        r_post = session.post(CCASS_URL, data=payload, headers=HEADERS, timeout=10)
+        r_post = session.post(CCASS_URL, data=payload, headers=HEADERS, timeout=12)
         soup_res = BeautifulSoup(r_post.text, "lxml")
 
         rows = soup_res.select("table.table-scroll tbody tr")
@@ -60,16 +72,16 @@ def get_ccass_snapshot(session, stock_code, date_str):
 
         records = []
         for row in rows:
-            pid = row.select_one("td.col-participant-id div.mobile-list-body")
-            shares = row.select_one("td.col-shareholding div.mobile-list-body")
-            pct = row.select_one("td.col-shareholding-percent div.mobile-list-body")
-            if not (pid and shares and pct):
+            pid_txt = extract_cell(row, "col-participant-id")
+            shares_txt = extract_cell(row, "col-shareholding").replace(",", "")
+            pct_txt = extract_cell(row, "col-shareholding-percent").replace("%", "")
+            if not (pid_txt and shares_txt.isdigit()):
                 continue
-
-            pid_txt = pid.get_text(strip=True)
-            shares_val = int(shares.get_text(strip=True).replace(",", ""))
-            pct_val = float(pct.get_text(strip=True).replace("%", "") or 0)
-            records.append({"id": pid_txt, "shares": shares_val, "pct": pct_val})
+            records.append({
+                "id": pid_txt,
+                "shares": int(shares_txt),
+                "pct": float(pct_txt or 0),
+            })
 
         if not records:
             return None
@@ -100,6 +112,7 @@ def analyze_stock(code, name):
         return None
 
     if hist.empty or len(hist) < 30:
+        print(f"[{code}] 股價數據不足", flush=True)
         return None
 
     close = round(float(hist["Close"].iloc[-1]), 2)
@@ -113,15 +126,30 @@ def analyze_stock(code, name):
     t2_vol = int(hist["Volume"].iloc[-3]) if len(hist) >= 3 else int(hist["Volume"].iloc[-1])
 
     dates = hist.index.strftime("%Y/%m/%d").tolist()
-    latest_d = dates[-1]
-    prev1_d = dates[-2] if len(dates) >= 2 else latest_d
-    prev20_d = dates[-21] if len(dates) >= 21 else dates[0]
+    # 自動嘗試最近 3 個交易日，避開收市後當日 CCASS 未發布的情況
+    snap_now = None
+    now_idx = len(dates) - 1
+    for offset in [1, 2, 3]:
+        if len(dates) >= offset:
+            d_try = dates[-offset]
+            snap_now = get_ccass_snapshot(session, code, d_try)
+            if snap_now:
+                now_idx = len(dates) - offset
+                break
 
-    snap_now = get_ccass_snapshot(session, code, latest_d)
+    # 若 CCASS 暫時無法取得，仍保留股價與趨勢資料，不讓表格空白
     if not snap_now:
-        snap_now = get_ccass_snapshot(session, code, prev1_d)
-        if not snap_now:
-            return None
+        print(f"[{code}] CCASS 暫無數據，僅輸出股價趨勢", flush=True)
+        return {
+            "code": f"{code}.HK", "name": name, "price": close, "chg_pct": chg_pct,
+            "stage2": "✅ Stage 2" if stage2 else "⏸️ 整理/弱勢",
+            "nb_pct": None, "nb_chg_20d": 0.0, "long_chg_20d": 0.0,
+            "retail_chg_20d": 0.0, "top10_pct": None, "top10_chg_20d": 0.0,
+            "part_chg_20d": 0, "trap": "暫無CCASS", "score": 1 if stage2 else 0,
+        }
+
+    prev1_d = dates[max(0, now_idx - 1)]
+    prev20_d = dates[max(0, now_idx - 20)]
 
     snap_prev1 = get_ccass_snapshot(session, code, prev1_d)
     snap_20d = get_ccass_snapshot(session, code, prev20_d)
@@ -153,7 +181,7 @@ def analyze_stock(code, name):
     if top10_chg_20d > 0 and part_chg_20d <= 0:
         score += 1
 
-    print(f"完成 {code}.HK ({name}) | 評分: {score}/5", flush=True)
+    print(f"完成 {code}.HK ({name}) | 北水: {snap_now['nb_pct']}% | 評分: {score}/5", flush=True)
     return {
         "code": f"{code}.HK",
         "name": name,
@@ -184,19 +212,26 @@ def build_html(results):
         retail_cls = "up" if r["retail_chg_20d"] < 0 else ("down" if r["retail_chg_20d"] > 0 else "")
         top10_cls = "up" if r["top10_chg_20d"] > 0 else ("down" if r["top10_chg_20d"] < 0 else "")
 
-        golden_tag = '<span class="badge gold">黃金期</span>' if (5 <= r["nb_pct"] <= 25 and r["nb_chg_20d"] > 0) else ""
-        trap_html = f'<span class="badge warn">{r["trap"]}</span>' if "疑似" in r["trap"] else '<span class="muted">正常</span>'
+        if r["nb_pct"] is None:
+            nb_cell = '<span class="muted">N/A</span>'
+            top10_cell = '<span class="muted">N/A</span>'
+        else:
+            golden_tag = '<span class="badge gold">黃金期</span>' if (5 <= r["nb_pct"] <= 25 and r["nb_chg_20d"] > 0) else ""
+            nb_cell = f"{r['nb_pct']:.2f}% {golden_tag}"
+            top10_cell = f"{r['top10_pct']:.1f}% <span class=\"{top10_cls}\">({r['top10_chg_20d']:+.2f}%)</span>"
+
+        trap_html = f'<span class="badge warn">{r["trap"]}</span>' if "疑似" in r["trap"] else f'<span class="muted">{r["trap"]}</span>'
 
         rows_html += f"""
         <tr>
             <td><strong>{r['code']}</strong><br><small class="muted">{r['name']}</small></td>
             <td>{r['price']:.2f} <span class="{price_cls}">({r['chg_pct']:+.2f}%)</span></td>
             <td>{r['stage2']}</td>
-            <td>{r['nb_pct']:.2f}% {golden_tag}</td>
+            <td>{nb_cell}</td>
             <td class="{nb_cls}">{r['nb_chg_20d']:+.2f}%</td>
             <td class="{long_cls}">{r['long_chg_20d']:+.2f}%</td>
             <td class="{retail_cls}">{r['retail_chg_20d']:+.2f}%</td>
-            <td>{r['top10_pct']:.1f}% <span class="{top10_cls}">({r['top10_chg_20d']:+.2f}%)</span></td>
+            <td>{top10_cell}</td>
             <td>{r['part_chg_20d']:+d}</td>
             <td>{trap_html}</td>
             <td><strong>{r['score']} / 5</strong></td>
@@ -275,7 +310,6 @@ def build_html(results):
 
 if __name__ == "__main__":
     results = []
-    # 使用 4 線程同步抓取，大幅縮短執行時間
     with ThreadPoolExecutor(max_workers=4) as executor:
         futures = {
             executor.submit(analyze_stock, code, name): code
