@@ -10,12 +10,16 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # ==========================================
 # 核心自選股（無論是否處於 Stage 2，都會強制納入 CCASS 深度掃描）
 # ==========================================
-PINNED_CODES = {
-    "00700", "03690", "01810", "09988", "00941",
-    "00883", "01024", "02015", "09868", "00981",
-    "02382", "09660", "01686", "02858", "09880",
-    "02276", "06082", "06166", "00388", "01211"
+PINNED_NAMES = {
+    "00700": "騰訊控股", "03690": "美團-W", "01810": "小米集團-W",
+    "09988": "阿里巴巴-W", "00941": "中國移動", "00883": "中國海洋石油",
+    "01024": "快手-W", "02015": "理想汽車-W", "09868": "小鵬汽車-W",
+    "00981": "中芯國際", "02382": "舜宇光學", "09660": "地平線機械人",
+    "01686": "新意網集團", "02858": "易鑫集團", "09880": "優必選",
+    "02276": "康耐特光學", "06082": "壁仞科技", "06166": "劍橋科技",
+    "00388": "香港交易所", "01211": "比亞迪股份"
 }
+PINNED_CODES = set(PINNED_NAMES.keys())
 
 MAX_CCASS_STOCKS = 85  # 每次最多深度掃描 CCASS 的股票上限（確保 3 分鐘內跑完）
 
@@ -33,58 +37,133 @@ HEADERS = {
 }
 
 
+def extract_cell(row, css_class):
+    td = row.select_one(f"td.{css_class}")
+    if not td:
+        return ""
+    body = td.select_one("div.mobile-list-body")
+    return body.get_text(strip=True) if body else td.get_text(strip=True)
+
+
 def parse_mutual_table(html):
     """解析港交所滬深港通持股總表，回傳 {5位代號: {'name': 股名, 'nb_pct': 北水比例}}"""
     soup = BeautifulSoup(html, "lxml")
     result = {}
     for row in soup.select("table tbody tr"):
-        tds = [td.get_text(" ", strip=True) for td in row.find_all("td")]
+        tds = row.find_all("td")
         if len(tds) < 4:
             continue
-        m_code = re.search(r"\b(\d{5})\b", tds[0])
+
+        # 優先讀取 mobile-list-body 內的純文字，避免混入欄位標題
+        vals = []
+        for td in tds[:4]:
+            body = td.select_one("div.mobile-list-body")
+            vals.append(body.get_text(strip=True) if body else td.get_text(" ", strip=True))
+
+        m_code = re.search(r"\b(\d{5})\b", vals[0])
         if not m_code:
             continue
         code = m_code.group(1)
-        if code.startswith("8"):  # 排除 8 開頭人民幣雙櫃台重複股份
+        if code.startswith("8"):  # 排除 8 字頭人民幣雙櫃台重複股份
             continue
-        name = re.sub(r"^股份名稱[:：]\s*", "", tds[1]).strip()
-        m_pct = re.search(r"([\d\.]+)\s*%", tds[3])
+
+        name = PINNED_NAMES.get(code) or re.sub(r"^股份名稱[:：]\s*", "", vals[1]).strip()
+        m_pct = re.search(r"([\d\.]+)\s*%", vals[3])
         pct = float(m_pct.group(1)) if m_pct else 0.0
         result[code] = {"name": name, "nb_pct": pct}
     return result
 
 
-def get_southbound_universe(date_20d_str=None):
-    """一次過取得全港股通約 550 隻名單、最新北水% 及 20 日前北水%"""
+def fetch_eastmoney_southbound():
+    """備援接口：當港交所總表維護時，從東方財富港股通板塊 (MK0144+MK0146) 讀取全名單"""
+    url = "https://push2.eastmoney.com/api/qt/clist/get"
+    params = {
+        "pn": 1,
+        "pz": 1000,
+        "po": 1,
+        "np": 1,
+        "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+        "fltt": 2,
+        "invt": 2,
+        "fid": "f3",
+        "fs": "b:MK0144,b:MK0146",
+        "fields": "f12,f14",
+    }
+    try:
+        r = requests.get(url, params=params, headers={"User-Agent": HEADERS["User-Agent"]}, timeout=12)
+        data = r.json()
+        diff = data.get("data", {}).get("diff", [])
+        result = {}
+        for item in diff:
+            code = str(item.get("f12", "")).zfill(5)
+            if len(code) == 5 and code.isdigit() and not code.startswith("8"):
+                name = PINNED_NAMES.get(code) or str(item.get("f14", code)).strip()
+                result[code] = {"name": name, "nb_pct": 0.0}
+        return result
+    except Exception as e:
+        print(f"備援港股通名單讀取失敗: {e}", flush=True)
+        return {}
+
+
+def get_southbound_universe(recent_dates, date_20d_str=None):
+    """取得全港股通約 550 隻名單、中文股名及北水比例"""
     session = requests.Session()
     headers = {**HEADERS, "Referer": MUTUAL_URL}
     r_get = session.get(MUTUAL_URL, headers=headers, timeout=15)
     latest_map = parse_mutual_table(r_get.text)
-    print(f"成功讀取全港股通名單：共 {len(latest_map)} 隻", flush=True)
 
-    prev20_map = {}
-    if date_20d_str and latest_map:
-        try:
-            soup = BeautifulSoup(r_get.text, "lxml")
-            vs = soup.find("input", {"id": "__VIEWSTATE"})
-            gen = soup.find("input", {"id": "__VIEWSTATEGENERATOR"})
-            val = soup.find("input", {"id": "__EVENTVALIDATION"})
-            if vs and gen:
+    soup = BeautifulSoup(r_get.text, "lxml")
+    vs = soup.find("input", {"id": "__VIEWSTATE"})
+    gen = soup.find("input", {"id": "__VIEWSTATEGENERATOR"})
+    val = soup.find("input", {"id": "__EVENTVALIDATION"})
+
+    # 若初始 GET 為空表，主動帶入最新交易日進行 POST 查詢
+    if not latest_map and vs and gen:
+        for d_try in reversed(recent_dates[-3:]):
+            try:
                 payload = {
                     "__EVENTTARGET": "btnSearch",
                     "__EVENTARGUMENT": "",
                     "__VIEWSTATE": vs["value"],
                     "__VIEWSTATEGENERATOR": gen["value"],
                     "today": datetime.datetime.now().strftime("%Y%m%d"),
-                    "txtShareholdingDate": date_20d_str,
+                    "txtShareholdingDate": d_try,
                 }
                 if val:
                     payload["__EVENTVALIDATION"] = val["value"]
                 r_post = session.post(MUTUAL_URL, data=payload, headers=headers, timeout=15)
-                prev20_map = parse_mutual_table(r_post.text)
-                print(f"成功讀取 20 日前 ({date_20d_str}) 北水總表：共 {len(prev20_map)} 隻", flush=True)
+                latest_map = parse_mutual_table(r_post.text)
+                if latest_map:
+                    print(f"透過 POST ({d_try}) 成功讀取港股通總表", flush=True)
+                    break
+            except Exception:
+                continue
+
+    # 若港交所總表仍無回傳，自動切換至備援接口確保拿到全 550 隻名單
+    if not latest_map:
+        print("港交所北水總表暫無回傳，啟動備援接口讀取全港股通名單...", flush=True)
+        latest_map = fetch_eastmoney_southbound()
+
+    print(f"成功讀取全港股通名單：共 {len(latest_map)} 隻", flush=True)
+
+    prev20_map = {}
+    if date_20d_str and vs and gen:
+        try:
+            payload = {
+                "__EVENTTARGET": "btnSearch",
+                "__EVENTARGUMENT": "",
+                "__VIEWSTATE": vs["value"],
+                "__VIEWSTATEGENERATOR": gen["value"],
+                "today": datetime.datetime.now().strftime("%Y%m%d"),
+                "txtShareholdingDate": date_20d_str,
+            }
+            if val:
+                payload["__EVENTVALIDATION"] = val["value"]
+            r_post = session.post(MUTUAL_URL, data=payload, headers=headers, timeout=15)
+            prev20_map = parse_mutual_table(r_post.text)
+            print(f"成功讀取 20 日前 ({date_20d_str}) 北水總表：共 {len(prev20_map)} 隻", flush=True)
         except Exception as e:
-            print(f"20 日前北水總表讀取略過: {e}", flush=True)
+            print(f"20 日前北水總表略過: {e}", flush=True)
 
     return latest_map, prev20_map
 
@@ -144,14 +223,6 @@ def batch_download_prices(codes):
                 continue
 
     return price_stats
-
-
-def extract_cell(row, css_class):
-    td = row.select_one(f"td.{css_class}")
-    if not td:
-        return ""
-    body = td.select_one("div.mobile-list-body")
-    return body.get_text(strip=True) if body else td.get_text(strip=True)
 
 
 def get_ccass_snapshot(session, stock_code, date_str):
@@ -450,13 +521,12 @@ def build_html(results, total_universe, total_stage2):
 
 
 if __name__ == "__main__":
-    # 先用騰訊取得基準交易日曆（找出 20 個交易日前的日期）
     ref_hist = yf.Ticker("0700.HK").history(period="3mo")
     ref_dates = ref_hist.index.strftime("%Y/%m/%d").tolist()
     date_20d = ref_dates[-21] if len(ref_dates) >= 21 else (ref_dates[0] if ref_dates else None)
 
     # 1. 取得全港股通約 550 隻名單及北水比例
-    latest_map, prev20_map = get_southbound_universe(date_20d)
+    latest_map, prev20_map = get_southbound_universe(ref_dates, date_20d)
     all_codes = sorted(set(latest_map.keys()) | PINNED_CODES)
 
     # 2. 批量下載全部 550 隻股價，篩選 Stage 2 與強勢股
@@ -470,7 +540,8 @@ if __name__ == "__main__":
         if code not in price_stats:
             continue
         p = price_stats[code]
-        info_now = latest_map.get(code, {"name": f"{code}.HK", "nb_pct": 0.0})
+        default_name = PINNED_NAMES.get(code, f"{code}.HK")
+        info_now = latest_map.get(code, {"name": default_name, "nb_pct": 0.0})
         info_20d = prev20_map.get(code, {})
         nb_now = info_now["nb_pct"]
         nb_chg = round(nb_now - info_20d["nb_pct"], 2) if "nb_pct" in info_20d else 0.0
