@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="zh-HK">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>港股 CANSLIM 機構籌碼 Dashboard（北水 + CCASS）</title>
+<link rel="stylesheet" href="https://cdn.datatables.net/1.13.6/css/jquery.dataTables.min.css">
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f172a; color: #e2e8f0; margin: 0; padding: 24px; }
+  h1 { margin: 0 0 6px 0; font-size: 24px; color: #f8fafc; }
+  .meta { color: #94a3b8; font-size: 13px; margin-bottom: 20px; }
+  .card { background: #1e293b; border-radius: 12px; padding: 20px; box-shadow: 0 4px 20px rgba(0,0,0,0.3); overflow-x: auto; }
+  table.dataTable { color: #e2e8f0; border-collapse: collapse; width: 100% !important; }
+  table.dataTable thead th { background: #334155; color: #f8fafc; padding: 12px 10px; text-align: left; border-bottom: 2px solid #475569; }
+  table.dataTable tbody td { padding: 12px 10px; border-bottom: 1px solid #334155; }
+  table.dataTable tbody tr:hover { background: #26354d; }
+  .up { color: #22c55e; font-weight: 600; }
+  .down { color: #ef4444; font-weight: 600; }
+  .muted { color: #94a3b8; font-size: 12px; }
+  .badge { padding: 2px 7px; border-radius: 999px; font-size: 11px; font-weight: 600; }
+  .badge.gold { background: #ca8a04; color: #fefce8; margin-left: 4px; }
+  .badge.warn { background: #b91c1c; color: #fee2e2; }
+  .dataTables_wrapper .dataTables_filter input, .dataTables_wrapper .dataTables_length select { background: #0f172a; color: #f8fafc; border: 1px solid #475569; border-radius: 6px; padding: 4px 8px; }
+  .dataTables_wrapper .dataTables_info, .dataTables_wrapper .dataTables_paginate { color: #94a3b8 !important; margin-top: 12px; }
+</style>
+</head>
+<body>
+  <h1>港股 CANSLIM 機構籌碼 Dashboard（北水 + CCASS）</h1>
+  <div class="meta">最後更新：2026-11-23 16:56 HKT ｜ 每日 09:00（開市前）及 16:30（收市後）自動更新 ｜ 配色：綠升紅跌</div>
+  <div class="card">
+    <table id="dashboard" class="display">
+      <thead>
+        <tr>
+          <th>股票</th>
+          <th>現價 / 漲跌</th>
+          <th>趨勢狀態</th>
+          <th>北水持股 %</th>
+          <th>北水 20日變動</th>
+          <th>外資大行 20日</th>
+          <th>散戶席位 20日</th>
+          <th>Top 10 集中度</th>
+          <th>參與者數目變動</th>
+          <th>存倉/射倉排雷</th>
+          <th>I 評分</th>
+        </tr>
+      </thead>
+      <tbody>
+        
+      </tbody>
+    </table>
+  </div>
+<script src="https://code.jquery.com/jquery-3.7.0.min.js"></script>
+<script src="https://cdn.datatables.net/1.13.6/js/jquery.dataTables.min.js"></script>
+<script>
+  $(document).ready(function() {
+    $('#dashboard').DataTable({
+      order: [[10, 'desc']],
+      pageLength: 25,
+      language: { search: "搜尋股票：", lengthMenu: "顯示 _MENU_ 筆", info: "第 _START_ 至 _END_ 筆，共 _TOTAL_ 筆" }
+    });
+  });
+</script>
+</body>
+</html>
