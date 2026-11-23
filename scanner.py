@@ -1,37 +1,27 @@
-import time
 import datetime
 import pytz
 import requests
 import pandas as pd
 import yfinance as yf
 from bs4 import BeautifulSoup
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ==========================================
-# 1. 港股通觀察名單（可隨時自行增減 5 位數代號）
+# 1. 港股通觀察名單（直接寫上中文名，免去 yfinance 慢速查詢）
 # ==========================================
-WATCHLIST = [
-    "00700", "03690", "01810", "09988", "00941",
-    "00883", "01024", "02015", "09868", "00981",
-    "02382", "09660", "01686", "02858", "09880",
-    "02276", "06082", "06166", "00388", "01211"
-]
+WATCHLIST = {
+    "00700": "騰訊控股", "03690": "美團-W", "01810": "小米集團-W",
+    "09988": "阿里巴巴-W", "00941": "中國移動", "00883": "中國海洋石油",
+    "01024": "快手-W", "02015": "理想汽車-W", "09868": "小鵬汽車-W",
+    "00981": "中芯國際", "02382": "舜宇光學", "09660": "地平線機械人",
+    "01686": "新意網集團", "02858": "易鑫集團", "09880": "優必選",
+    "02276": "康耐特光學", "06082": "壁仞科技", "06166": "劍橋科技",
+    "00388": "香港交易所", "01211": "比亞迪股份"
+}
 
-# CCASS 席位分類字典（港交所參與者編號前綴或代碼）
-NORTHBOUND_IDS = {"A00003", "A00004"}  # 滬港通 / 深港通（中登香港 / 創盈）
-LONG_ONLY_IDS = {
-    "C00010",  # 花旗 Citibank
-    "C00019",  # 匯豐 HSBC
-    "C00100",  # 摩根大通 JPMorgan
-    "C00039",  # 渣打 Standard Chartered
-    "C00018",  # 法巴 BNP
-}
-RETAIL_IDS = {
-    "B01955",  # 富途證券
-    "B01491",  # 耀才證券
-    "B01590",  # 盈透 IB
-    "B02153",  # 老虎證券
-    "B01274",  # 中銀國際/零售常見席位
-}
+NORTHBOUND_IDS = {"A00003", "A00004"}
+LONG_ONLY_IDS = {"C00010", "C00019", "C00100", "C00039", "C00018"}
+RETAIL_IDS = {"B01955", "B01491", "B01590", "B02153", "B01274"}
 
 CCASS_URL = "https://www3.hkexnews.hk/sdw/search/searchsdw_c.aspx"
 HEADERS = {
@@ -42,7 +32,7 @@ HEADERS = {
 def get_ccass_snapshot(session, stock_code, date_str):
     """抓取指定日期 (YYYY/MM/DD) 的 HKEX CCASS 持倉快照"""
     try:
-        r_get = session.get(CCASS_URL, headers=HEADERS, timeout=15)
+        r_get = session.get(CCASS_URL, headers=HEADERS, timeout=8)
         soup = BeautifulSoup(r_get.text, "lxml")
 
         viewstate = soup.find("input", {"id": "__VIEWSTATE"})
@@ -61,7 +51,7 @@ def get_ccass_snapshot(session, stock_code, date_str):
             "txtStockCode": stock_code.zfill(5),
         }
 
-        r_post = session.post(CCASS_URL, data=payload, headers=HEADERS, timeout=20)
+        r_post = session.post(CCASS_URL, data=payload, headers=HEADERS, timeout=10)
         soup_res = BeautifulSoup(r_post.text, "lxml")
 
         rows = soup_res.select("table.table-scroll tbody tr")
@@ -71,7 +61,6 @@ def get_ccass_snapshot(session, stock_code, date_str):
         records = []
         for row in rows:
             pid = row.select_one("td.col-participant-id div.mobile-list-body")
-            name = row.select_one("td.col-participant-name div.mobile-list-body")
             shares = row.select_one("td.col-shareholding div.mobile-list-body")
             pct = row.select_one("td.col-shareholding-percent div.mobile-list-body")
             if not (pid and shares and pct):
@@ -80,48 +69,36 @@ def get_ccass_snapshot(session, stock_code, date_str):
             pid_txt = pid.get_text(strip=True)
             shares_val = int(shares.get_text(strip=True).replace(",", ""))
             pct_val = float(pct.get_text(strip=True).replace("%", "") or 0)
-            records.append({
-                "id": pid_txt,
-                "name": name.get_text(strip=True) if name else "",
-                "shares": shares_val,
-                "pct": pct_val,
-            })
+            records.append({"id": pid_txt, "shares": shares_val, "pct": pct_val})
 
         if not records:
             return None
 
         df = pd.DataFrame(records)
-        top10_pct = df.head(10)["pct"].sum()
-        nb_pct = df[df["id"].isin(NORTHBOUND_IDS)]["pct"].sum()
-        long_pct = df[df["id"].isin(LONG_ONLY_IDS)]["pct"].sum()
-        retail_pct = df[df["id"].isin(RETAIL_IDS)]["pct"].sum()
-
         return {
             "df": df.set_index("id"),
             "participants": len(df),
-            "top10_pct": round(top10_pct, 2),
-            "nb_pct": round(nb_pct, 2),
-            "long_pct": round(long_pct, 2),
-            "retail_pct": round(retail_pct, 2),
+            "top10_pct": round(df.head(10)["pct"].sum(), 2),
+            "nb_pct": round(df[df["id"].isin(NORTHBOUND_IDS)]["pct"].sum(), 2),
+            "long_pct": round(df[df["id"].isin(LONG_ONLY_IDS)]["pct"].sum(), 2),
+            "retail_pct": round(df[df["id"].isin(RETAIL_IDS)]["pct"].sum(), 2),
         }
     except Exception as e:
-        print(f"[{stock_code}] CCASS 讀取失敗 ({date_str}): {e}")
+        print(f"[{stock_code}] CCASS 失敗 ({date_str}): {e}", flush=True)
         return None
 
 
-def get_trading_dates(hist):
-    """從股價歷史中取得最新、前一日、以及 20 個交易日前的日期"""
-    dates = hist.index.strftime("%Y/%m/%d").tolist()
-    latest = dates[-1]
-    prev_1d = dates[-2] if len(dates) >= 2 else latest
-    prev_20d = dates[-21] if len(dates) >= 21 else dates[0]
-    return latest, prev_1d, prev_20d
-
-
-def analyze_stock(session, code):
+def analyze_stock(code, name):
+    print(f"開始掃描 {code}.HK ({name})...", flush=True)
+    session = requests.Session()
     yf_ticker = f"{int(code):04d}.HK"
-    tk = yf.Ticker(yf_ticker)
-    hist = tk.history(period="9mo")
+
+    try:
+        hist = yf.Ticker(yf_ticker).history(period="9mo")
+    except Exception as e:
+        print(f"[{code}] yfinance 失敗: {e}", flush=True)
+        return None
+
     if hist.empty or len(hist) < 30:
         return None
 
@@ -133,32 +110,28 @@ def analyze_stock(session, code):
     ma150 = hist["Close"].rolling(150).mean().iloc[-1] if len(hist) >= 150 else ma50
     stage2 = (close > ma50) and (ma50 > ma150)
 
-    # T-2 日全市場成交量（用於排雷：存倉/射倉比對）
     t2_vol = int(hist["Volume"].iloc[-3]) if len(hist) >= 3 else int(hist["Volume"].iloc[-1])
 
-    latest_d, prev1_d, prev20_d = get_trading_dates(hist)
+    dates = hist.index.strftime("%Y/%m/%d").tolist()
+    latest_d = dates[-1]
+    prev1_d = dates[-2] if len(dates) >= 2 else latest_d
+    prev20_d = dates[-21] if len(dates) >= 21 else dates[0]
 
-    # 抓取最新、前一日（檢查存倉）、20日前（檢查斜率與貨歸邊）
     snap_now = get_ccass_snapshot(session, code, latest_d)
     if not snap_now:
         snap_now = get_ccass_snapshot(session, code, prev1_d)
         if not snap_now:
             return None
 
-    time.sleep(0.5)
     snap_prev1 = get_ccass_snapshot(session, code, prev1_d)
-    time.sleep(0.5)
     snap_20d = get_ccass_snapshot(session, code, prev20_d)
-    time.sleep(0.5)
 
-    # 計算 20 日籌碼變化
     nb_chg_20d = round(snap_now["nb_pct"] - snap_20d["nb_pct"], 2) if snap_20d else 0.0
     long_chg_20d = round(snap_now["long_pct"] - snap_20d["long_pct"], 2) if snap_20d else 0.0
     retail_chg_20d = round(snap_now["retail_pct"] - snap_20d["retail_pct"], 2) if snap_20d else 0.0
     top10_chg_20d = round(snap_now["top10_pct"] - snap_20d["top10_pct"], 2) if snap_20d else 0.0
     part_chg_20d = (snap_now["participants"] - snap_20d["participants"]) if snap_20d else 0
 
-    # 排雷：檢查單一席位單日持股變動是否大於 T-2 成交量
     trap_flag = False
     if snap_prev1 and t2_vol > 0:
         merged = snap_now["df"][["shares"]].join(
@@ -168,24 +141,19 @@ def analyze_stock(session, code):
         if max_single_jump > t2_vol * 1.05:
             trap_flag = True
 
-    # CANSLIM "I" 綜合評分 (滿分 5 分)
     score = 0
     if stage2:
         score += 1
     if 5.0 <= snap_now["nb_pct"] <= 25.0 and nb_chg_20d > 0.2:
-        score += 1  # 處於 5%-25% 增倉黃金期
+        score += 1
     if long_chg_20d > 0.1 or nb_chg_20d > 0.3:
-        score += 1  # 外資大行或北水持續增倉
+        score += 1
     if retail_chg_20d < -0.05:
-        score += 1  # 散戶席位同步減倉（貨歸邊）
+        score += 1
     if top10_chg_20d > 0 and part_chg_20d <= 0:
-        score += 1  # 集中度上升且參與者減少
+        score += 1
 
-    try:
-        name = tk.info.get("shortName") or yf_ticker
-    except Exception:
-        name = yf_ticker
-
+    print(f"完成 {code}.HK ({name}) | 評分: {score}/5", flush=True)
     return {
         "code": f"{code}.HK",
         "name": name,
@@ -210,11 +178,9 @@ def build_html(results):
 
     rows_html = ""
     for r in sorted(results, key=lambda x: (x["score"], x["nb_chg_20d"]), reverse=True):
-        # 綠升紅跌配色
         price_cls = "up" if r["chg_pct"] >= 0 else "down"
         nb_cls = "up" if r["nb_chg_20d"] > 0 else ("down" if r["nb_chg_20d"] < 0 else "")
         long_cls = "up" if r["long_chg_20d"] > 0 else ("down" if r["long_chg_20d"] < 0 else "")
-        # 散戶減倉對機構吸籌屬正面訊號，以綠色標記
         retail_cls = "up" if r["retail_chg_20d"] < 0 else ("down" if r["retail_chg_20d"] > 0 else "")
         top10_cls = "up" if r["top10_chg_20d"] > 0 else ("down" if r["top10_chg_20d"] < 0 else "")
 
@@ -304,15 +270,19 @@ def build_html(results):
 
     with open("index.html", "w", encoding="utf-8") as f:
         f.write(html)
-    print("index.html 已成功生成！")
+    print(f"index.html 已成功生成！共 {len(results)} 隻股票。", flush=True)
 
 
 if __name__ == "__main__":
-    session = requests.Session()
     results = []
-    for code in WATCHLIST:
-        print(f"正在掃描 {code}.HK ...")
-        res = analyze_stock(session, code)
-        if res:
-            results.append(res)
+    # 使用 4 線程同步抓取，大幅縮短執行時間
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = {
+            executor.submit(analyze_stock, code, name): code
+            for code, name in WATCHLIST.items()
+        }
+        for future in as_completed(futures):
+            res = future.result()
+            if res:
+                results.append(res)
     build_html(results)
