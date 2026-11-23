@@ -21,11 +21,24 @@ PINNED_NAMES = {
 }
 PINNED_CODES = set(PINNED_NAMES.keys())
 
-MAX_CCASS_STOCKS = 85  # 每次最多深度掃描 CCASS 的股票上限（確保 3 分鐘內跑完）
+MAX_CCASS_STOCKS = 95  # 每次最多深度掃描 CCASS 的股票上限（兼顧覆蓋率與執行速度）
 
-NORTHBOUND_IDS = {"A00003", "A00004"}
-LONG_ONLY_IDS = {"C00010", "C00019", "C00100", "C00039", "C00018"}
-RETAIL_IDS = {"B01955", "B01491", "B01590", "B02153", "B01274"}
+# CCASS 席位分類代碼
+NORTHBOUND_IDS = {"A00003", "A00004"}  # 滬港通 / 深港通（中登香港 / 創盈）
+LONG_ONLY_IDS = {
+    "C00010",  # 花旗 Citibank
+    "C00019",  # 匯豐 HSBC
+    "C00100",  # 摩根大通 JPMorgan
+    "C00039",  # 渣打 Standard Chartered
+    "C00018",  # 法巴 BNP
+}
+RETAIL_IDS = {
+    "B01955",  # 富途證券
+    "B01491",  # 耀才證券
+    "B01590",  # 盈透 IB
+    "B02153",  # 老虎證券
+    "B01274",  # 中銀國際/零售常見席位
+}
 
 MUTUAL_URL = "https://www3.hkexnews.hk/sdw/search/mutualmarket_c.aspx?t=hk"
 CCASS_URL = "https://www3.hkexnews.hk/sdw/search/searchsdw_c.aspx"
@@ -54,7 +67,6 @@ def parse_mutual_table(html):
         if len(tds) < 4:
             continue
 
-        # 優先讀取 mobile-list-body 內的純文字，避免混入欄位標題
         vals = []
         for td in tds[:4]:
             body = td.select_one("div.mobile-list-body")
@@ -75,34 +87,38 @@ def parse_mutual_table(html):
 
 
 def fetch_eastmoney_southbound():
-    """備援接口：當港交所總表維護時，從東方財富港股通板塊 (MK0144+MK0146) 讀取全名單"""
+    """備援接口：分頁讀取全部約 550 隻港股通名單"""
     url = "https://push2.eastmoney.com/api/qt/clist/get"
-    params = {
-        "pn": 1,
-        "pz": 1000,
-        "po": 1,
-        "np": 1,
-        "ut": "bd1d9ddb04089700cf9c27f6f7426281",
-        "fltt": 2,
-        "invt": 2,
-        "fid": "f3",
-        "fs": "b:MK0144,b:MK0146",
-        "fields": "f12,f14",
-    }
-    try:
-        r = requests.get(url, params=params, headers={"User-Agent": HEADERS["User-Agent"]}, timeout=12)
-        data = r.json()
-        diff = data.get("data", {}).get("diff", [])
-        result = {}
-        for item in diff:
-            code = str(item.get("f12", "")).zfill(5)
-            if len(code) == 5 and code.isdigit() and not code.startswith("8"):
-                name = PINNED_NAMES.get(code) or str(item.get("f14", code)).strip()
-                result[code] = {"name": name, "nb_pct": 0.0}
-        return result
-    except Exception as e:
-        print(f"備援港股通名單讀取失敗: {e}", flush=True)
-        return {}
+    result = {}
+    for page in range(1, 9):  # 每頁 100 隻，抓第 1 至 8 頁完整覆蓋全部港股通
+        params = {
+            "pn": page,
+            "pz": 100,
+            "po": 1,
+            "np": 1,
+            "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+            "fltt": 2,
+            "invt": 2,
+            "fid": "f3",
+            "fs": "b:MK0144,b:MK0146",
+            "fields": "f12,f14",
+        }
+        try:
+            r = requests.get(url, params=params, headers={"User-Agent": HEADERS["User-Agent"]}, timeout=12)
+            diff = r.json().get("data", {}).get("diff", [])
+            if isinstance(diff, dict):
+                diff = list(diff.values())
+            if not diff:
+                break
+            for item in diff:
+                code = str(item.get("f12", "")).zfill(5)
+                if len(code) == 5 and code.isdigit() and not code.startswith("8"):
+                    name = PINNED_NAMES.get(code) or str(item.get("f14", code)).strip()
+                    result[code] = {"name": name, "nb_pct": 0.0}
+        except Exception as e:
+            print(f"備援港股通第 {page} 頁讀取失敗: {e}", flush=True)
+            break
+    return result
 
 
 def get_southbound_universe(recent_dates, date_20d_str=None):
@@ -139,9 +155,9 @@ def get_southbound_universe(recent_dates, date_20d_str=None):
             except Exception:
                 continue
 
-    # 若港交所總表仍無回傳，自動切換至備援接口確保拿到全 550 隻名單
+    # 若港交所總表暫無回傳，自動切換至分頁備援接口讀取全 550+ 隻名單
     if not latest_map:
-        print("港交所北水總表暫無回傳，啟動備援接口讀取全港股通名單...", flush=True)
+        print("港交所北水總表暫無回傳，啟動分頁備援接口讀取全港股通名單...", flush=True)
         latest_map = fetch_eastmoney_southbound()
 
     print(f"成功讀取全港股通名單：共 {len(latest_map)} 隻", flush=True)
@@ -169,7 +185,7 @@ def get_southbound_universe(recent_dates, date_20d_str=None):
 
 
 def batch_download_prices(codes):
-    """分批極速下載全部 550 隻港股通的 9 個月量價數據"""
+    """分批極速下載全部 ~550 隻港股通的 9 個月量價數據"""
     price_stats = {}
     code_list = list(codes)
     chunk_size = 150
@@ -226,6 +242,7 @@ def batch_download_prices(codes):
 
 
 def get_ccass_snapshot(session, stock_code, date_str):
+    """抓取指定日期 (YYYY/MM/DD) 的 HKEX CCASS 持倉快照"""
     try:
         r_get = session.get(CCASS_URL, headers=HEADERS, timeout=10)
         soup = BeautifulSoup(r_get.text, "lxml")
@@ -325,6 +342,7 @@ def analyze_ccass_detail(item):
     top10_chg_20d = round(snap_now["top10_pct"] - snap_20d["top10_pct"], 2) if snap_20d else 0.0
     part_chg_20d = (snap_now["participants"] - snap_20d["participants"]) if snap_20d else 0
 
+    # 排雷：檢查單一席位單日持股變動是否大於 T-2 成交量
     trap_flag = False
     if snap_prev1 and p["t2_vol"] > 0:
         merged = snap_now["df"][["shares"]].join(
@@ -334,17 +352,18 @@ def analyze_ccass_detail(item):
         if max_single_jump > p["t2_vol"] * 1.05:
             trap_flag = True
 
+    # CANSLIM "I" 綜合評分 (滿分 5 分)
     score = 0
     if p["stage2"]:
         score += 1
     if 5.0 <= nb_pct <= 25.0 and nb_chg_20d > 0.2:
-        score += 1
+        score += 1  # 處於 5%-25% 增倉黃金期
     if long_chg_20d > 0.1 or nb_chg_20d > 0.3:
-        score += 1
+        score += 1  # 外資大行或北水持續增倉
     if retail_chg_20d < -0.05:
-        score += 1
+        score += 1  # 散戶席位同步減倉（貨歸邊）
     if top10_chg_20d > 0 and part_chg_20d <= 0:
-        score += 1
+        score += 1  # 集中度上升且參與者減少
 
     print(f"完成 {code}.HK ({name}) | 北水: {nb_pct}% ({nb_chg_20d:+.2f}%) | 評分: {score}/5", flush=True)
     return {
@@ -529,12 +548,12 @@ if __name__ == "__main__":
     latest_map, prev20_map = get_southbound_universe(ref_dates, date_20d)
     all_codes = sorted(set(latest_map.keys()) | PINNED_CODES)
 
-    # 2. 批量下載全部 550 隻股價，篩選 Stage 2 與強勢股
+    # 2. 批量下載全部 ~550 隻股價，篩選 Stage 2 與強勢股
     price_stats = batch_download_prices(all_codes)
     total_stage2 = sum(1 for v in price_stats.values() if v["stage2"])
     print(f"股價初篩完成：全港股通 {len(latest_map)} 隻中，共有 {total_stage2} 隻處於 Stage 2。", flush=True)
 
-    # 3. 組合需要深度抓 CCASS 的名單（核心自選股 + Stage 2 強勢股 + 北水 20日急增股）
+    # 3. 組合需要深度抓 CCASS 的名單（核心自選股 + 所有 Stage 2 上升趨勢股 + 北水 20日急增股）
     candidates = []
     for code in all_codes:
         if code not in price_stats:
@@ -547,11 +566,11 @@ if __name__ == "__main__":
         nb_chg = round(nb_now - info_20d["nb_pct"], 2) if "nb_pct" in info_20d else 0.0
 
         is_pinned = code in PINNED_CODES
-        is_stage2_strong = p["stage2"] and (nb_chg > 0 or p["near_high"])
-        is_early_accum = (not p["stage2"]) and (nb_chg >= 0.8)
+        is_stage2 = p["stage2"]
+        is_early_accum = (not is_stage2) and (nb_chg >= 0.8)
 
-        if is_pinned or is_stage2_strong or is_early_accum:
-            priority = (100 if is_pinned else 0) + (50 if p["stage2"] else 0) + nb_chg
+        if is_pinned or is_stage2 or is_early_accum:
+            priority = (100 if is_pinned else 0) + (50 if is_stage2 else 0) + nb_chg
             candidates.append({
                 "code_raw": code,
                 "name": info_now["name"],
